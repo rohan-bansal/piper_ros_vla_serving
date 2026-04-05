@@ -34,7 +34,9 @@ import time
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
+from std_msgs.msg import Bool
 from piper_sdk import C_PiperInterface_V2
+import numpy as np
 
 
 def _wait_enter(prompt: str) -> None:
@@ -68,19 +70,23 @@ class TeleopLoopNode(Node):
 
         self.declare_parameter('can_port', 'can0')
         self.declare_parameter('gripper_exist', True)
-        self.declare_parameter('move_speed', 30)
+        self.declare_parameter('move_speed', 0xAD) # 1-100, passed to MotionCtrl_2 for follower movement, will be high-follow mode if 0xAD
         # Preset joint positions in radians (joints 1-6) + gripper in metres.
         # Published on joint_ctrl when resetting the remote follower to home.
         self.declare_parameter('preset_joints', [-0.02886982, 1.0887149280000001, -1.17476618, -0.040696852000000006, 1.194704672, -0.038743124000000004, 0.0])
         # Timeout for CAN mode confirmation after exiting teach mode
         self.declare_parameter('can_mode_timeout', 5.0)
+        # Speed used when resetting the follower to preset/zero (slower for safety)
+        self.declare_parameter('preset_speed', 30)
 
         self.can_port = self.get_parameter('can_port').get_parameter_value().string_value
         self.gripper_exist = self.get_parameter('gripper_exist').get_parameter_value().bool_value
         self.move_speed = self.get_parameter('move_speed').get_parameter_value().integer_value
+        self.preset_speed = self.get_parameter('preset_speed').get_parameter_value().integer_value
         self.preset_joints = list(
             self.get_parameter('preset_joints').get_parameter_value().double_array_value
         )
+
         self.can_mode_timeout = (
             self.get_parameter('can_mode_timeout').get_parameter_value().double_value
         )
@@ -90,6 +96,7 @@ class TeleopLoopNode(Node):
         self.get_logger().info(f"can_port: {self.can_port}")
         self.get_logger().info(f"gripper_exist: {self.gripper_exist}")
         self.get_logger().info(f"move_speed: {self.move_speed}")
+        self.get_logger().info(f"preset_speed: {self.preset_speed}")
         self.get_logger().info(f"preset_joints: {self.preset_joints}")
 
         # Connect to the teacher arm only
@@ -100,6 +107,7 @@ class TeleopLoopNode(Node):
         # Publisher: mirrors the topic published by piper_broadcast_master_v2.
         # The remote follower node subscribes to this.
         self.joint_ctrl_pub = self.create_publisher(JointState, 'joint_states', 1)
+        self.data_collect_pub = self.create_publisher(Bool, 'data_collect', 1)
 
         # Forwarding active flag — controlled by the operator loop thread
         self._forwarding = False
@@ -163,7 +171,7 @@ class TeleopLoopNode(Node):
                     "CAN mode switch timed out. Confirm teach mode is fully exited."
                 )
                 raise RuntimeError("CAN mode switch failed")
-            self.piper.ModeCtrl(0x01, 0x01, self.move_speed, 0x00)
+            self.piper.ModeCtrl(0x01, 0x01, self.preset_speed, 0x00)
             time.sleep(0.01)
 
         # Enable arm
@@ -173,7 +181,7 @@ class TeleopLoopNode(Node):
         if self.gripper_exist:
             time.sleep(0.01)
             self.piper.GripperCtrl(0, 1000, 0x01, 0x00)
-        self.piper.ModeCtrl(0x01, 0x01, self.move_speed, 0x00)
+        self.piper.ModeCtrl(0x01, 0x01, self.preset_speed, 0x00)
         self.get_logger().info("Teacher arm enabled in CAN mode.")
 
     def _wait_teach_mode_on(self) -> None:
@@ -191,19 +199,26 @@ class TeleopLoopNode(Node):
     # ── Preset-position reset ─────────────────────────────────────────────────
 
     def _move_and_stream(self, target_joints_rad: list, label: str,
-                         settle_timeout: float = 15.0) -> None:
+                         settle_timeout: float = 15.0,
+                         speed: int | None = None) -> None:
         """Command the teacher arm to a target position (radians) and stream
         its actual joint positions to the follower on joint_ctrl at 200 Hz
         until it arrives or the timeout expires.
+
+        ``speed`` controls velocity[6] sent to the follower (1-100).  Defaults
+        to ``self.move_speed`` when None.
         """
         RAD_TO_RAW = 57324.840764   # millidegrees per radian
         arrival_threshold = 0.05    # rad per-joint tolerance
         dt = 1.0 / 200.0
 
+        if speed is None:
+            speed = self.move_speed
+
         target_raw = [round(j * RAD_TO_RAW) for j in target_joints_rad]
 
-        self.get_logger().info(f"Moving teacher arm to {label}…")
-        self.piper.MotionCtrl_2(0x01, 0x01, 30)
+        self.get_logger().info(f"Moving teacher arm to {label} (speed={speed})…")
+        self.piper.MotionCtrl_2(0x01, 0x01, speed)
 
         for i in range(6):
             self.piper.JointCtrl(*target_raw)
@@ -211,7 +226,7 @@ class TeleopLoopNode(Node):
 
         deadline = time.time() + settle_timeout
         while time.time() < deadline:
-            self._publish_teacher_joints()
+            self._publish_teacher_joints(speed=speed)
             pos = self._get_pos()
             if all(abs(pos[i] - target_joints_rad[i]) < arrival_threshold for i in range(6)):
                 break
@@ -220,7 +235,7 @@ class TeleopLoopNode(Node):
         # Extra streaming to let the follower fully settle
         settle_extra = time.time() + 0.5
         while time.time() < settle_extra:
-            self._publish_teacher_joints()
+            self._publish_teacher_joints(speed=speed)
             time.sleep(dt)
 
         self.get_logger().info(f"Teacher arm reached {label}.")
@@ -236,13 +251,17 @@ class TeleopLoopNode(Node):
         zero_joints = [0.0] * 6
         preset_joints_rad = self.preset_joints[:6]
 
+        preset_joints_np = np.array(preset_joints_rad)
+        preset_joints_np = preset_joints_np + np.random.normal(0, 0.1, 6)
+        preset_joints_rad = preset_joints_np.tolist()
+
         # Stage 1: safe neutral position first
         if self.gripper_exist:
             self.piper.GripperCtrl(0, 1000, 0x01, 0x00)
-        self._move_and_stream(zero_joints, "zero position")
+        self._move_and_stream(zero_joints, "zero position", speed=self.preset_speed)
 
         # Stage 2: move to preset
-        self._move_and_stream(preset_joints_rad, "preset position")
+        self._move_and_stream(preset_joints_rad, "preset position", speed=self.preset_speed)
 
         # Apply preset gripper after arm reaches preset
         if self.gripper_exist:
@@ -256,9 +275,15 @@ class TeleopLoopNode(Node):
 
     def _data_collector_begin(self) -> None:
         self.get_logger().info("DATA COLLECTOR BEGIN")
+        msg = Bool()
+        msg.data = True
+        self.data_collect_pub.publish(msg)
 
     def _data_collector_end(self) -> None:
         self.get_logger().info("DATA COLLECTOR END")
+        msg = Bool()
+        msg.data = False
+        self.data_collect_pub.publish(msg)
 
     # ── Forwarding thread ─────────────────────────────────────────────────────
 
@@ -272,8 +297,15 @@ class TeleopLoopNode(Node):
                 self._publish_teacher_joints()
             rate.sleep()
 
-    def _publish_teacher_joints(self) -> None:
-        """Read teacher arm joints and publish as JointState on joint_ctrl."""
+    def _publish_teacher_joints(self, speed: int | None = None) -> None:
+        """Read teacher arm joints and publish as JointState on joint_ctrl.
+
+        ``speed`` is placed in velocity[6] and tells the follower's
+        piper_ctrl_single_node what speed to pass to MotionCtrl_2.
+        Defaults to ``self.move_speed`` when None.
+        """
+        if speed is None:
+            speed = self.move_speed
         try:
             js = self.piper.GetArmJointMsgs().joint_state
             # millidegrees → radians (same conversion as piper_broadcast_master_v2)
@@ -290,7 +322,7 @@ class TeleopLoopNode(Node):
             msg.header.stamp = self.get_clock().now().to_msg()
             msg.name = ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6', 'gripper']
             msg.position = positions
-            msg.velocity = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, float(self.move_speed)]
+            msg.velocity = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, float(speed)]
             msg.effort = [0.0] * 7
             self.joint_ctrl_pub.publish(msg)
 
@@ -305,7 +337,7 @@ class TeleopLoopNode(Node):
             # ── Step 1: operator disables teach mode; run e-stop exit sequence ─
             _wait_enter(
                 "\n" + "=" * 60 + "\n"
-                "Step 1: Disable teacher mode on the teacher arm.\n"
+                "Step 1: Move the teacher arm to zero, and disable teacher mode.\n"
                 "        Press Enter when teacher mode is disabled."
             )
             try:
@@ -326,9 +358,13 @@ class TeleopLoopNode(Node):
             self._wait_teach_mode_on()
 
             # ── Step 4: begin data collection + forwarding ────────────────────
-            self._data_collector_begin()
             with self._forwarding_lock:
                 self._forwarding = True
+
+            time.sleep(2)  # let the forwarding thread publish a few messages before data collection starts
+            print("\nStarting data collection...")
+
+            self._data_collector_begin()
 
             # ── Step 5: wait for stop signal ──────────────────────────────────
             _wait_enter("\nRecording started. Press Enter to stop.")
